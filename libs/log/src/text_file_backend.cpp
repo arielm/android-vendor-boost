@@ -13,6 +13,7 @@
  *         at http://www.boost.org/doc/libs/release/libs/log/doc/html/index.html.
  */
 
+#include <boost/log/detail/config.hpp>
 #include <ctime>
 #include <cctype>
 #include <cwctype>
@@ -21,7 +22,6 @@
 #include <cstdlib>
 #include <cstddef>
 #include <list>
-#include <memory>
 #include <string>
 #include <locale>
 #include <ostream>
@@ -54,6 +54,7 @@
 #include <boost/log/exceptions.hpp>
 #include <boost/log/attributes/time_traits.hpp>
 #include <boost/log/sinks/text_file_backend.hpp>
+#include "unique_ptr.hpp"
 
 #if !defined(BOOST_LOG_NO_THREADS)
 #include <boost/thread/locks.hpp>
@@ -217,31 +218,28 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         typedef date_time::time_facet< posix_time::ptime, path_char_type > time_facet_type;
 
     private:
-        time_facet_type* m_pFacet;
+        mutable time_facet_type m_Facet;
         mutable std::basic_ostringstream< path_char_type > m_Stream;
 
     public:
         //! Constructor
-        date_and_time_formatter() : m_pFacet(NULL)
+        date_and_time_formatter() : m_Facet(1u)
         {
-            std::auto_ptr< time_facet_type > pFacet(new time_facet_type());
-            m_pFacet = pFacet.get();
-            std::locale loc(m_Stream.getloc(), m_pFacet);
-            pFacet.release();
-            m_Stream.imbue(loc);
         }
         //! Copy constructor
-        date_and_time_formatter(date_and_time_formatter const& that) :
-            m_pFacet(that.m_pFacet)
+        date_and_time_formatter(date_and_time_formatter const& that) : m_Facet(1u)
         {
-            m_Stream.imbue(that.m_Stream.getloc());
         }
         //! The method formats the current date and time according to the format string str and writes the result into it
         path_string_type operator()(path_string_type const& pattern, unsigned int counter) const
         {
-            m_pFacet->format(pattern.c_str());
+            m_Facet.format(pattern.c_str());
             m_Stream.str(path_string_type());
-            m_Stream << boost::log::attributes::local_time_traits::get_clock();
+            // Note: the regular operator<< fails because std::use_facet fails to find the facet in the locale because
+            // the facet type in Boost.DateTime has hidden visibility. See this ticket:
+            // https://svn.boost.org/trac/boost/ticket/11707
+            std::ostreambuf_iterator< path_char_type > sbuf_it(m_Stream);
+            m_Facet.put(sbuf_it, m_Stream, m_Stream.fill(), boost::log::attributes::local_time_traits::get_clock());
             if (m_Stream.good())
             {
                 return m_Stream.str();
@@ -252,6 +250,8 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
                 return pattern;
             }
         }
+
+        BOOST_DELETED_FUNCTION(date_and_time_formatter& operator= (date_and_time_formatter const&))
     };
 
     //! The functor formats the file counter into the file name
@@ -297,6 +297,8 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
 
             return file_name;
         }
+
+        BOOST_DELETED_FUNCTION(file_counter_formatter& operator= (file_counter_formatter const&))
     };
 
     //! The function returns the pattern as the file name
@@ -323,6 +325,8 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         {
             return m_Pattern;
         }
+
+        BOOST_DELETED_FUNCTION(empty_formatter& operator= (empty_formatter const&))
     };
 
     //! The function parses the format placeholder for file counter
@@ -541,6 +545,9 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         uintmax_t m_MaxSize;
         //! Free space lower limit
         uintmax_t m_MinFreeSpace;
+        //! File count upper limit
+        uintmax_t m_MaxFiles;
+
         //! The current path at the point when the collector is created
         /*
          * The special member is required to calculate absolute paths with no
@@ -561,7 +568,8 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
             shared_ptr< file_collector_repository > const& repo,
             filesystem::path const& target_dir,
             uintmax_t max_size,
-            uintmax_t min_free_space);
+            uintmax_t min_free_space,
+            uintmax_t max_files);
 
         //! Destructor
         ~file_collector();
@@ -574,7 +582,7 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
             file::scan_method method, filesystem::path const& pattern, unsigned int* counter);
 
         //! The function updates storage restrictions
-        void update(uintmax_t max_size, uintmax_t min_free_space);
+        void update(uintmax_t max_size, uintmax_t min_free_space, uintmax_t max_files);
 
         //! The function checks if the directory is governed by this collector
         bool is_governed(filesystem::path const& dir) const
@@ -627,7 +635,7 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
     public:
         //! Finds or creates a file collector
         shared_ptr< file::collector > get_collector(
-            filesystem::path const& target_dir, uintmax_t max_size, uintmax_t min_free_space);
+            filesystem::path const& target_dir, uintmax_t max_size, uintmax_t min_free_space, uintmax_t max_files);
 
         //! Removes the file collector from the list
         void remove_collector(file_collector* p);
@@ -645,11 +653,13 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         shared_ptr< file_collector_repository > const& repo,
         filesystem::path const& target_dir,
         uintmax_t max_size,
-        uintmax_t min_free_space
+        uintmax_t min_free_space,
+        uintmax_t max_files
     ) :
         m_pRepository(repo),
         m_MaxSize(max_size),
         m_MinFreeSpace(min_free_space),
+        m_MaxFiles(max_files),
         m_BasePath(filesystem::current_path()),
         m_TotalSize(0)
     {
@@ -711,7 +721,7 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         uintmax_t free_space = m_MinFreeSpace ? filesystem::space(m_StorageDir).available : static_cast< uintmax_t >(0);
         file_list::iterator it = m_Files.begin(), end = m_Files.end();
         while (it != end &&
-            (m_TotalSize + info.m_Size > m_MaxSize || (m_MinFreeSpace && m_MinFreeSpace > free_space)))
+            (m_TotalSize + info.m_Size > m_MaxSize || (m_MinFreeSpace && m_MinFreeSpace > free_space) || m_MaxFiles <= m_Files.size()))
         {
             file_info& old_info = *it;
             if (filesystem::exists(old_info.m_Path) && filesystem::is_regular_file(old_info.m_Path))
@@ -826,18 +836,19 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
     }
 
     //! The function updates storage restrictions
-    void file_collector::update(uintmax_t max_size, uintmax_t min_free_space)
+    void file_collector::update(uintmax_t max_size, uintmax_t min_free_space, uintmax_t max_files)
     {
         BOOST_LOG_EXPR_IF_MT(lock_guard< mutex > lock(m_Mutex);)
 
         m_MaxSize = (std::min)(m_MaxSize, max_size);
         m_MinFreeSpace = (std::max)(m_MinFreeSpace, min_free_space);
+        m_MaxFiles = (std::min)(m_MaxFiles, max_files);
     }
 
 
     //! Finds or creates a file collector
     shared_ptr< file::collector > file_collector_repository::get_collector(
-        filesystem::path const& target_dir, uintmax_t max_size, uintmax_t min_free_space)
+        filesystem::path const& target_dir, uintmax_t max_size, uintmax_t min_free_space, uintmax_t max_files)
     {
         BOOST_LOG_EXPR_IF_MT(lock_guard< mutex > lock(m_Mutex);)
 
@@ -848,7 +859,7 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         {
             // This may throw if the collector is being currently destroyed
             p = it->shared_from_this();
-            p->update(max_size, min_free_space);
+            p->update(max_size, min_free_space, max_files);
         }
         catch (bad_weak_ptr&)
         {
@@ -857,7 +868,7 @@ BOOST_LOG_ANONYMOUS_NAMESPACE {
         if (!p)
         {
             p = boost::make_shared< file_collector >(
-                file_collector_repository::get(), target_dir, max_size, min_free_space);
+                file_collector_repository::get(), target_dir, max_size, min_free_space, max_files);
             m_Collectors.push_back(*p);
         }
 
@@ -904,9 +915,10 @@ namespace aux {
     BOOST_LOG_API shared_ptr< collector > make_collector(
         filesystem::path const& target_dir,
         uintmax_t max_size,
-        uintmax_t min_free_space)
+        uintmax_t min_free_space,
+        uintmax_t max_files)
     {
-        return file_collector_repository::get()->get_collector(target_dir, max_size, min_free_space);
+        return file_collector_repository::get()->get_collector(target_dir, max_size, min_free_space, max_files);
     }
 
 } // namespace aux
@@ -1208,11 +1220,10 @@ BOOST_LOG_API void text_file_backend::consume(record_view const& rec, string_typ
         m_pImpl->m_File.open(m_pImpl->m_FileName, m_pImpl->m_FileOpenMode);
         if (!m_pImpl->m_File.is_open())
         {
-            filesystem_error err(
+            BOOST_THROW_EXCEPTION(filesystem_error(
                 "Failed to open file for writing",
                 m_pImpl->m_FileName,
-                system::error_code(system::errc::io_error, system::generic_category()));
-            BOOST_THROW_EXCEPTION(err);
+                system::error_code(system::errc::io_error, system::generic_category())));
         }
 
         if (!m_pImpl->m_OpenHandler.empty())
